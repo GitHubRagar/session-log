@@ -1,0 +1,464 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0F1523">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon-192.png">
+<title>Session Log</title>
+<style>
+  :root { box-sizing: border-box; color-scheme: dark; }
+  * { box-sizing: inherit; }
+  html, body { margin: 0; min-height: 100%; }
+  body {
+    background: #0F1523; color: #E8ECF5;
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: calc(10px + env(safe-area-inset-top, 0px)) 12px
+             calc(14px + env(safe-area-inset-bottom, 0px));
+    -webkit-user-select: none; user-select: none;
+  }
+  h1 { font-size: 18px; margin: 0 0 10px; }
+  .card { background: #171F31; border-radius: 12px; padding: 11px 12px; margin-bottom: 9px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .dot { width: 9px; height: 9px; border-radius: 50%; background: #55607A;
+         display: inline-block; margin-right: 6px; }
+  .dot.on { background: #4CD07A; }
+  .big { font-size: 34px; font-weight: 650; font-variant-numeric: tabular-nums; line-height: 1.15; }
+  .unit { font-size: 14px; color: #96A2BC; font-weight: 400; }
+  .sub { font-size: 12.5px; color: #96A2BC; font-variant-numeric: tabular-nums; }
+  button { font: inherit; font-weight: 600; color: #0F1523; background: #6EA8FF;
+           border: 0; border-radius: 10px; padding: 11px 12px; min-height: 46px; }
+  button.ghost { background: #26314A; color: #E8ECF5; }
+  button.warn  { background: #E86A5B; color: #0F1523; }
+  button:disabled { opacity: .42; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+  .wide { grid-column: 1 / -1; }
+  label.opt { display: flex; align-items: center; gap: 8px; font-size: 14px; color: #C3CCE0; }
+  input[type=checkbox] { width: 20px; height: 20px; accent-color: #6EA8FF; }
+  select { font: inherit; background: #26314A; color: #E8ECF5; border: 0;
+           border-radius: 8px; padding: 7px 8px; }
+  #log { font-size: 11.5px; color: #8592AE; white-space: pre-wrap; word-break: break-word;
+         max-height: 20vh; overflow-y: auto; }
+</style>
+</head>
+<body>
+<h1>Session Log</h1>
+
+<div class="card">
+  <div class="row">
+    <div><span class="dot" id="dHR"></span>Polar H10</div>
+    <div class="sub" id="sHR">not connected</div>
+  </div>
+  <div class="big"><span id="vHR">--</span><span class="unit"> bpm</span></div>
+  <div class="sub" id="vRR">&nbsp;</div>
+  <div class="sub" id="vPMD">&nbsp;</div>
+</div>
+
+<div class="card">
+  <div class="row">
+    <div><span class="dot" id="dSpeed"></span>Treadmill</div>
+    <div class="sub" id="sSpeed">not connected</div>
+  </div>
+  <div class="big"><span id="vSpeed">--</span><span class="unit"> mph</span></div>
+  <div class="sub" id="vHz">&nbsp;</div>
+</div>
+
+<div class="card grid">
+  <label class="opt"><input type="checkbox" id="optEcg" checked> ECG 130 Hz</label>
+  <label class="opt"><input type="checkbox" id="optAcc" checked> ACC
+    <select id="accRate">
+      <option value="25">25 Hz</option>
+      <option value="50" selected>50 Hz</option>
+      <option value="100">100 Hz</option>
+      <option value="200">200 Hz</option>
+    </select>
+  </label>
+  <div class="sub wide">Set these before connecting the H10.</div>
+</div>
+
+<div class="card grid">
+  <button id="bHR">Connect H10</button>
+  <button id="bSpeed">Connect treadmill</button>
+  <button id="bMark" class="wide ghost" disabled>MARKER</button>
+  <div class="sub wide" id="stats">idle</div>
+</div>
+
+<div class="card grid">
+  <button id="bSave" class="ghost wide">Download all CSVs</button>
+  <button id="bStop" class="ghost">Disconnect</button>
+  <button id="bClear" class="warn">Clear data</button>
+</div>
+
+<div class="card"><div id="log">Ready.</div></div>
+
+<script>
+(() => {
+  'use strict';
+
+  // ---- UUIDs ----
+  const NUS_SVC = '6e400001-b5a3-f393-e0a9-e50e24dcca9e';
+  const NUS_TX  = '6e400003-b5a3-f393-e0a9-e50e24dcca9e';
+  const PMD_SVC  = 'fb005c80-02e7-f387-1cad-8acd2d8df0c8';
+  const PMD_CTRL = 'fb005c81-02e7-f387-1cad-8acd2d8df0c8';
+  const PMD_DATA = 'fb005c82-02e7-f387-1cad-8acd2d8df0c8';
+
+  // PMD timestamps count ns since 2000-01-01; convert to Unix ms.
+  const EPOCH_OFFSET_MS = 946684800000;
+
+  const $ = id => document.getElementById(id);
+  const log = m => {
+    const el = $('log');
+    el.textContent = new Date().toLocaleTimeString() + '  ' + m + '\n' + el.textContent;
+  };
+
+  // ---- storage ----
+  const D = {
+    rr: [],       // {hostMs, rrMs, hr}
+    hr: [],       // {hostMs, hr}
+    speed: [],    // {hostMs, mph, hz, total}
+    marks: [],    // {hostMs}
+    ecg: [],      // {tsNs, hostMs, samples:Int32Array}
+    acc: [],      // {tsNs, hostMs, x:Int16Array, y:Int16Array, z:Int16Array}
+    ecgN: 0, accN: 0
+  };
+  let devices = [];
+  let wakeLock = null;
+
+  const refreshStats = () => {
+    $('stats').textContent =
+      `RR ${D.rr.length} · ECG ${D.ecgN} · ACC ${D.accN} · speed ${D.speed.length} · marks ${D.marks.length}`;
+  };
+
+  async function keepAwake() {
+    try {
+      if ('wakeLock' in navigator && !wakeLock) {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => { wakeLock = null; });
+      }
+    } catch (e) {}
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') keepAwake();
+  });
+
+  // ---------- bit reader for PMD delta frames ----------
+  function readDeltaFrame(bytes, start, channels, refBits) {
+    // reference sample
+    const refBytes = refBits / 8;
+    const ref = [];
+    let p = start;
+    for (let c = 0; c < channels; c++) {
+      let v = 0;
+      for (let b = 0; b < refBytes; b++) v |= bytes[p + b] << (8 * b);
+      const signBit = 1 << (refBits - 1);
+      if (v & signBit) v -= (1 << refBits);
+      ref.push(v);
+      p += refBytes;
+    }
+    const out = [[], [], []];
+    for (let c = 0; c < channels; c++) out[c].push(ref[c]);
+
+    let bitPos = p * 8;
+    const totalBits = bytes.length * 8;
+
+    const readBits = n => {
+      let v = 0;
+      for (let i = 0; i < n; i++) {
+        const byte = bytes[(bitPos >> 3)];
+        const bit = (byte >> (bitPos & 7)) & 1;
+        v |= bit << i;
+        bitPos++;
+      }
+      return v;
+    };
+
+    while (bitPos + 16 <= totalBits) {
+      const deltaSize = readBits(8);
+      const count = readBits(8);
+      if (deltaSize === 0 || count === 0) break;
+      if (bitPos + deltaSize * count * channels > totalBits) break;
+      for (let s = 0; s < count; s++) {
+        for (let c = 0; c < channels; c++) {
+          let d = readBits(deltaSize);
+          const signBit = 1 << (deltaSize - 1);
+          if (d & signBit) d -= (1 << deltaSize);
+          ref[c] += d;
+          out[c].push(ref[c]);
+        }
+      }
+    }
+    return out;
+  }
+
+  // ---------- PMD data parsing ----------
+  function onPmdData(ev) {
+    const dv = ev.target.value;
+    const bytes = new Uint8Array(dv.buffer, dv.byteOffset, dv.byteLength);
+    if (bytes.length < 10) return;
+    const type = bytes[0];
+    let tsNs = 0n;
+    for (let i = 8; i >= 1; i--) tsNs = (tsNs << 8n) | BigInt(bytes[i]);
+    const frameType = bytes[9];
+    const hostMs = Date.now();
+
+    if (type === 0x00) {                     // ECG
+      if (frameType === 0x00) {
+        const n = Math.floor((bytes.length - 10) / 3);
+        const s = new Int32Array(n);
+        for (let i = 0; i < n; i++) {
+          const o = 10 + i * 3;
+          let v = bytes[o] | (bytes[o + 1] << 8) | (bytes[o + 2] << 16);
+          if (v & 0x800000) v -= 0x1000000;
+          s[i] = v;                          // microvolts
+        }
+        D.ecg.push({ tsNs, hostMs, samples: s });
+        D.ecgN += n;
+        $('vPMD').textContent = `ECG ${D.ecgN} · ACC ${D.accN} samples`;
+      }
+    } else if (type === 0x02) {              // accelerometer
+      let ch;
+      if (frameType === 0x01) {              // uncompressed 16-bit xyz
+        const n = Math.floor((bytes.length - 10) / 6);
+        ch = [[], [], []];
+        for (let i = 0; i < n; i++) {
+          const o = 10 + i * 6;
+          for (let c = 0; c < 3; c++) {
+            let v = bytes[o + c * 2] | (bytes[o + c * 2 + 1] << 8);
+            if (v & 0x8000) v -= 0x10000;
+            ch[c].push(v);
+          }
+        }
+      } else {                               // delta-compressed
+        ch = readDeltaFrame(bytes, 10, 3, 16);
+      }
+      if (ch && ch[0].length) {
+        D.acc.push({ tsNs, hostMs,
+                     x: Int16Array.from(ch[0]),
+                     y: Int16Array.from(ch[1]),
+                     z: Int16Array.from(ch[2]) });
+        D.accN += ch[0].length;
+        $('vPMD').textContent = `ECG ${D.ecgN} · ACC ${D.accN} samples`;
+      }
+    }
+    refreshStats();
+  }
+
+  // ---------- H10 ----------
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+  $('bHR').onclick = async () => {
+    if (!navigator.bluetooth) { log('Web Bluetooth unavailable — use Chrome.'); return; }
+    try {
+      const dev = await navigator.bluetooth.requestDevice({
+        filters: [{ services: ['heart_rate'] }],
+        optionalServices: [PMD_SVC, 'battery_service']
+      });
+      devices.push(dev);
+      dev.addEventListener('gattserverdisconnected', () => {
+        $('dHR').classList.remove('on');
+        $('sHR').textContent = 'disconnected';
+        log('H10 disconnected.');
+      });
+      const server = await dev.gatt.connect();
+      log('H10 connected: ' + dev.name);
+
+      // standard heart rate: HR + RR
+      const hrs = await server.getPrimaryService('heart_rate');
+      const hrc = await hrs.getCharacteristic('heart_rate_measurement');
+      await hrc.startNotifications();
+      hrc.addEventListener('characteristicvaluechanged', e => {
+        const dv = e.target.value, flags = dv.getUint8(0);
+        let i = 1, hr;
+        if (flags & 0x01) { hr = dv.getUint16(i, true); i += 2; } else { hr = dv.getUint8(i); i += 1; }
+        if (flags & 0x08) i += 2;
+        const hostMs = Date.now(), rr = [];
+        if (flags & 0x10) {
+          for (; i + 1 < dv.byteLength; i += 2) rr.push(dv.getUint16(i, true) * 1000 / 1024);
+        }
+        D.hr.push({ hostMs, hr });
+        rr.forEach(v => D.rr.push({ hostMs, rrMs: v, hr }));
+        $('vHR').textContent = hr;
+        if (rr.length) $('vRR').textContent = 'RR ' + rr.map(v => v.toFixed(1)).join(', ') + ' ms';
+        refreshStats();
+      });
+      $('dHR').classList.add('on');
+      $('sHR').textContent = 'connected';
+      $('bMark').disabled = false;
+      keepAwake();
+
+      // PMD streams
+      const wantEcg = $('optEcg').checked, wantAcc = $('optAcc').checked;
+      if (!wantEcg && !wantAcc) { log('RR only (PMD streams off).'); return; }
+
+      const pmd = await server.getPrimaryService(PMD_SVC);
+      const ctrl = await pmd.getCharacteristic(PMD_CTRL);
+      const data = await pmd.getCharacteristic(PMD_DATA);
+      await data.startNotifications();
+      data.addEventListener('characteristicvaluechanged', onPmdData);
+      try { await ctrl.startNotifications(); } catch (e) {}
+      try { await ctrl.readValue(); } catch (e) {}
+      await sleep(800);                       // let the streams report ready
+
+      if (wantEcg) {
+        // start ECG: 130 Hz, 14-bit
+        await ctrl.writeValueWithResponse(
+          new Uint8Array([0x02, 0x00, 0x00, 0x01, 0x82, 0x00, 0x01, 0x01, 0x0E, 0x00]));
+        log('ECG stream requested.');
+        await sleep(400);
+      }
+      if (wantAcc) {
+        const rate = parseInt($('accRate').value, 10);
+        await ctrl.writeValueWithResponse(new Uint8Array([
+          0x02, 0x02,
+          0x00, 0x01, rate & 0xFF, (rate >> 8) & 0xFF,   // sample rate
+          0x01, 0x01, 0x10, 0x00,                        // resolution 16
+          0x02, 0x01, 0x08, 0x00                         // range 8G
+        ]));
+        log('ACC stream requested at ' + rate + ' Hz.');
+      }
+    } catch (e) { log('H10: ' + e.message); }
+  };
+
+  // ---------- treadmill ----------
+  $('bSpeed').onclick = async () => {
+    if (!navigator.bluetooth) { log('Web Bluetooth unavailable — use Chrome.'); return; }
+    try {
+      const dev = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: 'TreadSpeed' }], optionalServices: [NUS_SVC]
+      });
+      devices.push(dev);
+      dev.addEventListener('gattserverdisconnected', () => {
+        $('dSpeed').classList.remove('on');
+        $('sSpeed').textContent = 'disconnected';
+        log('Treadmill disconnected.');
+      });
+      const server = await dev.gatt.connect();
+      const svc = await server.getPrimaryService(NUS_SVC);
+      const ch = await svc.getCharacteristic(NUS_TX);
+      await ch.startNotifications();
+      ch.addEventListener('characteristicvaluechanged', e => {
+        const txt = new TextDecoder().decode(e.target.value).trim();
+        if (txt.startsWith('>>')) return;
+        const p = txt.split('\t');
+        if (p.length !== 4) return;
+        const total = +p[0], hz = +p[2], mph = +p[3];
+        if (!isFinite(mph)) return;
+        D.speed.push({ hostMs: Date.now(), mph, hz, total });
+        $('vSpeed').textContent = mph.toFixed(2);
+        $('vHz').textContent = hz.toFixed(2) + ' Hz · ' + total + ' pulses';
+        refreshStats();
+      });
+      $('dSpeed').classList.add('on');
+      $('sSpeed').textContent = 'connected';
+      $('bMark').disabled = false;
+      log('Treadmill connected.');
+      keepAwake();
+    } catch (e) { log('Treadmill: ' + e.message); }
+  };
+
+  // ---------- marker ----------
+  $('bMark').onclick = () => {
+    D.marks.push({ hostMs: Date.now() });
+    if (navigator.vibrate) navigator.vibrate(60);
+    log('MARKER');
+    refreshStats();
+  };
+
+  // ---------- export ----------
+  const iso = ms => new Date(ms).toISOString();
+
+  function download(name, text) {
+    const blob = new Blob([text], { type: 'text/csv' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = name;
+    a.click();
+    setTimeout(() => URL.revokeObjectURL(a.href), 8000);
+  }
+
+  function stamp() {
+    const first = D.speed[0]?.hostMs || D.rr[0]?.hostMs || D.ecg[0]?.hostMs || Date.now();
+    const d = new Date(first), p = n => String(n).padStart(2, '0');
+    return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}_${p(d.getHours())}${p(d.getMinutes())}`;
+  }
+
+  $('bSave').onclick = async () => {
+    const tag = stamp();
+    let files = 0;
+
+    if (D.rr.length) {
+      const L = ['iso_time,unix_ms,rr_ms,hr_bpm'];
+      for (const r of D.rr) L.push(`${iso(r.hostMs)},${r.hostMs},${r.rrMs.toFixed(2)},${r.hr}`);
+      download(`rr_${tag}.csv`, L.join('\n') + '\n'); files++;
+      await sleep(500);
+    }
+    if (D.speed.length) {
+      const L = ['iso_time,unix_ms,mph,hz,total_pulses'];
+      for (const s of D.speed)
+        L.push(`${iso(s.hostMs)},${s.hostMs},${s.mph.toFixed(3)},${s.hz.toFixed(3)},${s.total}`);
+      download(`speed_${tag}.csv`, L.join('\n') + '\n'); files++;
+      await sleep(500);
+    }
+    if (D.marks.length) {
+      const L = ['iso_time,unix_ms'];
+      for (const m of D.marks) L.push(`${iso(m.hostMs)},${m.hostMs}`);
+      download(`markers_${tag}.csv`, L.join('\n') + '\n'); files++;
+      await sleep(500);
+    }
+    if (D.acc.length) {
+      const rate = parseInt($('accRate').value, 10);
+      const stepNs = 1e9 / rate;
+      const L = ['device_ms,host_ms,x_mg,y_mg,z_mg'];
+      for (const f of D.acc) {
+        const n = f.x.length;
+        const lastMs = Number(f.tsNs / 1000000n) + EPOCH_OFFSET_MS;
+        for (let i = 0; i < n; i++) {
+          const t = lastMs - (n - 1 - i) * (stepNs / 1e6);
+          L.push(`${t.toFixed(2)},${i === n - 1 ? f.hostMs : ''},${f.x[i]},${f.y[i]},${f.z[i]}`);
+        }
+      }
+      download(`acc_${tag}.csv`, L.join('\n') + '\n'); files++;
+      await sleep(800);
+    }
+    if (D.ecg.length) {
+      const stepNs = 1e9 / 130;
+      const L = ['device_ms,host_ms,uv'];
+      for (const f of D.ecg) {
+        const n = f.samples.length;
+        const lastMs = Number(f.tsNs / 1000000n) + EPOCH_OFFSET_MS;
+        for (let i = 0; i < n; i++) {
+          const t = lastMs - (n - 1 - i) * (stepNs / 1e6);
+          L.push(`${t.toFixed(2)},${i === n - 1 ? f.hostMs : ''},${f.samples[i]}`);
+        }
+      }
+      download(`ecg_${tag}.csv`, L.join('\n') + '\n'); files++;
+    }
+    log(files ? `Saved ${files} file(s), tag ${tag}.` : 'Nothing to save.');
+  };
+
+  $('bStop').onclick = () => {
+    devices.forEach(d => { try { d.gatt.disconnect(); } catch (e) {} });
+    devices = [];
+    log('Disconnected. Data kept — download before clearing.');
+  };
+
+  $('bClear').onclick = () => {
+    if (!confirm('Discard all recorded data?')) return;
+    D.rr.length = D.hr.length = D.speed.length = D.marks.length = 0;
+    D.ecg.length = D.acc.length = 0; D.ecgN = D.accN = 0;
+    refreshStats(); log('Cleared.');
+  };
+
+  window.addEventListener('beforeunload', e => {
+    if (D.rr.length || D.speed.length || D.ecgN) { e.preventDefault(); e.returnValue = ''; }
+  });
+
+  if ('serviceWorker' in navigator && location.protocol === 'https:') {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  }
+  refreshStats();
+})();
+</script>
+</body>
+</html>
